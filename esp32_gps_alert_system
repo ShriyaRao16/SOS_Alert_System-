@@ -1,0 +1,162 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+
+// ---------------- USER SETTINGS ----------------
+const char* WIFI_SSID     = "YOUR_WIFI_USERNAME";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+#define BOT_TOKEN  "YOUR_BOT_TOKEN_LINK"
+#define CHAT_ID    "YOUR_BOT_ID"  
+
+const int GPS_POWER_PIN   = 25;            
+const unsigned long GPS_FIX_TIMEOUT_MS = 90000;  
+const unsigned long GPS_BAUD = 9600;
+const unsigned long STM32_BAUD = 115200;
+// -------------------------------------------------
+
+HardwareSerial STM32Serial(2);   // UART2: RX2=16, TX2=17 (TX2 unused here)
+HardwareSerial GPSSerial(1);     // UART1: RX1=4,  TX1=2
+TinyGPSPlus gps;
+
+WiFiClientSecure secured_client;
+UniversalTelegramBot bot(BOT_TOKEN, secured_client);
+
+enum AlertState { IDLE, WARNING_ACTIVE, EMERGENCY_ACTIVE };
+AlertState state = IDLE;
+bool alertSentForThisEvent = false;
+
+// ---------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);                       // USB debug console
+  STM32Serial.begin(STM32_BAUD, SERIAL_8N1, 16, 17);   // RX2=16 from STM32
+  pinMode(GPS_POWER_PIN, OUTPUT);
+  digitalWrite(GPS_POWER_PIN, LOW);            // GPS OFF at boot -- saves power
+
+  connectWiFi();
+  secured_client.setInsecure();                // skip cert validation (simplest for Telegram API)
+
+  Serial.println("Ready. Waiting for STM32 alert (W = warning, E = emergency)...");
+}
+
+// ---------------------------------------------------------------
+void loop() {
+  checkSTM32Message();
+
+  if (state == WARNING_ACTIVE || state == EMERGENCY_ACTIVE) {
+    handleAlert();
+  }
+}
+
+// ---------------------------------------------------------------
+// Read single-character messages from the STM32 over UART.
+// Expected protocol: STM32 sends 'W' for WARNING, 'E' for EMERGENCY,
+// 'S' for back-to-SAFE (optional, lets you reset/cancel).
+void checkSTM32Message() {
+  while (STM32Serial.available()) {
+    char c = STM32Serial.read();
+
+    if (c == 'E' && state != EMERGENCY_ACTIVE) {
+      Serial.println("[STM32] EMERGENCY received");
+      state = EMERGENCY_ACTIVE;
+      alertSentForThisEvent = false;
+    } else if (c == 'W' && state == IDLE) {
+      Serial.println("[STM32] WARNING received");
+      state = WARNING_ACTIVE;
+      alertSentForThisEvent = false;
+    } else if (c == 'S') {
+      Serial.println("[STM32] back to SAFE -- resetting");
+      state = IDLE;
+      alertSentForThisEvent = false;
+      digitalWrite(GPS_POWER_PIN, LOW);        // power GPS back down
+    }
+  }
+}
+
+// ---------------------------------------------------------------
+void handleAlert() {
+  if (alertSentForThisEvent) return;         
+
+  Serial.println("Powering on GPS...");
+  digitalWrite(GPS_POWER_PIN, HIGH);
+  GPSSerial.begin(GPS_BAUD, SERIAL_8N1, 4, 2);  // RX1=4, TX1=2 (to GPS module)
+
+  double lat = 0, lon = 0;
+  bool gotFix = waitForGPSFix(lat, lon);
+
+  String label = (state == EMERGENCY_ACTIVE) ? "EMERGENCY" : "WARNING";
+  sendTelegramAlert(label, gotFix, lat, lon);
+
+  alertSentForThisEvent = true;
+  digitalWrite(GPS_POWER_PIN, LOW);             
+  Serial.println("GPS powered off.");
+}
+
+// ---------------------------------------------------------------
+// Feeds GPS serial data into TinyGPS++ until we get a valid fix
+// or the timeout expires. Returns true if a fix was obtained.
+bool waitForGPSFix(double &lat, double &lon) {
+  unsigned long start = millis();
+  Serial.println("Waiting for GPS fix...");
+
+  while (millis() - start < GPS_FIX_TIMEOUT_MS) {
+    while (GPSSerial.available()) {
+      gps.encode(GPSSerial.read());
+    }
+    if (gps.location.isValid() && gps.location.isUpdated()) {
+      lat = gps.location.lat();
+      lon = gps.location.lng();
+      Serial.printf("GPS fix: %.6f, %.6f\n", lat, lon);
+      return true;
+    }
+    // Also keep checking for an EMERGENCY upgrade while waiting
+    checkSTM32Message();
+  }
+  Serial.println("GPS fix timed out -- sending alert without location.");
+  return false;
+}
+
+// ---------------------------------------------------------------
+void sendTelegramAlert(String label, bool gotFix, double lat, double lon) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected -- trying to reconnect...");
+    connectWiFi();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Still no WiFi -- cannot send Telegram alert!");
+      return;                                  
+    }
+  }
+
+  String msg = "*" + label + " ALERT*\n";
+  if (gotFix) {
+    msg += "Location: " + String(lat, 6) + ", " + String(lon, 6) + "\n";
+    msg += "Map: https://maps.google.com/?q=" + String(lat, 6) + "," + String(lon, 6) + "\n";
+  } else {
+    msg += "Location unavailable (no GPS fix in time)\n";
+  }
+  msg += "Time since boot: " + String(millis() / 1000) + "s";
+
+  Serial.println("Sending Telegram message...");
+  bool ok = bot.sendMessage(CHAT_ID, msg, "Markdown");
+  Serial.println(ok ? "Telegram message sent." : "Telegram send FAILED.");
+}
+
+// ---------------------------------------------------------------
+void connectWiFi() {
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi connected, IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi connect FAILED (will retry when an alert happens).");
+  }
+}
